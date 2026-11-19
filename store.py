@@ -143,7 +143,7 @@ class Store:
                                      on_hand=on_hand, reserved=reserved, available=on_hand-reserved))
             return rows
 
-    def receive(self, warehouse, source, lines, token):
+    def receive(self, warehouse, source, lines, token, actor=None):
         source = self._text(source, 'Источник поступления')
         token = self._text(token, 'Идентификатор операции', 64)
         with self.connection(write=True) as db:
@@ -157,10 +157,11 @@ class Store:
             for product, quantity in lines.items():
                 db.execute('INSERT INTO movements(warehouse_id,product_id,quantity,receipt_id) '
                            'VALUES(?,?,?,?)', (warehouse, product, quantity, receipt_id))
-            self._event(db, 'Поступление', {'номер': receipt_id, 'источник': source, 'позиции': lines})
+            self._event(db, 'Поступление', {'номер': receipt_id, 'источник': source,
+                                          'позиции': lines, 'оператор': actor})
             return receipt_id
 
-    def create_request(self, warehouse, destination, lines, code, note=''):
+    def create_request(self, warehouse, destination, lines, code, note='', actor=None):
         destination = self._text(destination, 'Получатель или пункт передачи')
         code = self._text(code, 'Идентификатор заявки', 64)
         if len(note) > 500:
@@ -175,7 +176,7 @@ class Store:
                                     'VALUES(?,?,?,?)', (code, warehouse, destination, note.strip())).lastrowid
             db.executemany('INSERT INTO request_lines VALUES(?,?,?)',
                            [(request_id, product, quantity) for product, quantity in lines.items()])
-            self._event(db, 'Создание заявки', {'получатель': destination}, request_id)
+            self._event(db, 'Создание заявки', {'получатель': destination, 'оператор': actor}, request_id)
             return request_id
 
     def request(self, request_id):
@@ -195,7 +196,7 @@ class Store:
         result['events'] = self.query('SELECT * FROM events WHERE request_id=? ORDER BY id', (request_id,))
         return result
 
-    def transition(self, request_id, action):
+    def transition(self, request_id, action, actor=None):
         with self.connection(write=True) as db:
             request = db.execute('SELECT * FROM requests WHERE id=?', (request_id,)).fetchone()
             if not request:
@@ -226,7 +227,7 @@ class Store:
             else:
                 raise DomainError('Действие недоступно для текущего статуса заявки. Обновите страницу.')
             db.execute('UPDATE requests SET status=? WHERE id=?', (new_status, request_id))
-            self._event(db, title, {'из': status, 'в': new_status}, request_id)
+            self._event(db, title, {'из': status, 'в': new_status, 'оператор': actor}, request_id)
 
     def seed_demo(self):
         """Explicit opt-in seed. No real recipient or donor data."""

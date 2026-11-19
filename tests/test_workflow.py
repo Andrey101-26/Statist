@@ -117,8 +117,11 @@ class WebTests(unittest.TestCase):
         self.store = self.app.extensions['store']
         self.store.seed_demo()
         self.client = self.app.test_client()
+        token = self.app.extensions['access'].invite('coordinator', bootstrap=True)
+        user = self.app.extensions['access'].register(token, 'test-coordinator', 'a-long-test-password')
         self.client.get('/')
         with self.client.session_transaction() as session:
+            session['user_id'] = user['id']
             self.csrf = session['csrf']
 
     def tearDown(self):

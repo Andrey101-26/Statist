@@ -6,14 +6,18 @@ import io
 import json
 import os
 import secrets
+from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from flask import Flask, Response, abort, flash, redirect, render_template, request, session, url_for
+from flask import Flask, Response, abort, flash, g, redirect, render_template, request, session, url_for
 from jinja2 import DictLoader
 
 from store import DomainError, Store
 from ui import TEMPLATES
+from access import Access, ROLES, can
+from access_ui import TEMPLATES as ACCESS_TEMPLATES
+from catalogs import import_catalog, parse_csv
 
 STATUSES = {'draft': 'Ожидает резерва', 'reserved': 'В резерве',
             'issued': 'Передана', 'cancelled': 'Отменена'}
@@ -22,16 +26,34 @@ STATUSES = {'draft': 'Ожидает резерва', 'reserved': 'В резер
 def create_app(database=None, testing=False):
     app = Flask(__name__)
     app.config.update(TESTING=testing, MAX_CONTENT_LENGTH=64 * 1024,
+                      PUBLIC_DEMO=os.environ.get('STATIST_PUBLIC_DEMO', '1') == '1',
                       SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax')
-    app.jinja_loader = DictLoader(TEMPLATES)
+    app.jinja_loader = DictLoader(TEMPLATES | ACCESS_TEMPLATES)
     store = Store(database or os.environ.get('STATIST_DATABASE') or
                   Path(__file__).parent / 'instance' / 'statist.sqlite3')
     app.extensions['store'] = store
+    access = Access(store)
+    app.extensions['access'] = access
     app.config['SECRET_KEY'] = os.environ.get('STATIST_SECRET_KEY') or store.session_secret()
+    app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=12)
 
     @app.before_request
     def csrf_protection():
         session.setdefault('csrf', secrets.token_hex(32))
+        g.user = access.user(session.get('user_id')) if session.get('user_id') else None
+        g.demo = bool(store.query('SELECT 1 FROM metadata WHERE key="demo" AND value="1"'))
+        required = {'new_receipt': 'receipt', 'new_request': 'request',
+                    'catalogs': 'catalog', 'catalog_template': 'catalog', 'accounts': 'accounts'}
+        permission = required.get(request.endpoint)
+        if request.endpoint == 'change_request':
+            permission = (request.view_args or {}).get('action', 'unknown')
+        if permission and not can(g.user, permission):
+            if not g.user and request.method == 'GET':
+                return redirect(url_for('login'))
+            abort(403, 'Недостаточно прав для этого действия.')
+        public = {'login', 'join', 'accept_invitation', 'health'}
+        if not g.user and not (g.demo and app.config['PUBLIC_DEMO']) and request.endpoint and request.endpoint not in public:
+            return redirect(url_for('login'))
         if request.method == 'POST' and not secrets.compare_digest(
                 session['csrf'].encode(), request.form.get('csrf', '').encode()):
             abort(400, 'Форма устарела или открыта в другой сессии. Обновите страницу и повторите действие.')
@@ -49,8 +71,99 @@ def create_app(database=None, testing=False):
 
     @app.context_processor
     def common():
-        return dict(csrf=session['csrf'], statuses=STATUSES,
-                    demo=bool(store.query('SELECT 1 FROM metadata WHERE key="demo" AND value="1"')))
+        return dict(csrf=session['csrf'], statuses=STATUSES, demo=g.demo,
+                    user=g.user, roles=ROLES, can=lambda action: can(g.user, action))
+
+    @app.route('/login', methods=['GET', 'POST'])
+    def login():
+        error = None
+        if request.method == 'POST':
+            try:
+                user = access.login(request.form.get('username', ''), request.form.get('password', ''),
+                                    request.remote_addr)
+                if user:
+                    session.clear()
+                    session.update(user_id=user['id'], csrf=secrets.token_hex(32))
+                    session.permanent = True
+                    return redirect(url_for('dashboard'))
+                error = 'Неверный логин или пароль.'
+            except DomainError as exc:
+                error = str(exc)
+        return render_template('login.html', title='Вход', section='', error=error), 401 if error else 200
+
+    @app.post('/logout')
+    def logout():
+        session.clear()
+        return redirect(url_for('login'))
+
+    @app.get('/join/<token>')
+    def accept_invitation(token):
+        if not access.invitation(token):
+            abort(410, 'Приглашение использовано или срок действия истёк.')
+        session['invitation'] = token
+        return redirect(url_for('join'))
+
+    @app.route('/join', methods=['GET', 'POST'])
+    def join():
+        token = session.get('invitation', '')
+        invitation = access.invitation(token)
+        if not invitation:
+            abort(410, 'Для создания аккаунта нужна действующая ссылка от координатора.')
+        error = None
+        if request.method == 'POST':
+            try:
+                if request.form.get('password') != request.form.get('password_repeat'):
+                    raise DomainError('Пароли не совпадают.')
+                user = access.register(token, request.form.get('username', ''), request.form.get('password', ''))
+                session.clear()
+                session.update(user_id=user['id'], csrf=secrets.token_hex(32))
+                session.permanent = True
+                return redirect(url_for('dashboard'))
+            except DomainError as exc:
+                error = str(exc)
+        return render_template('join.html', title='Создание аккаунта', section='',
+                               invitation=invitation, error=error), 422 if error else 200
+
+    @app.route('/accounts', methods=['GET', 'POST'])
+    def accounts():
+        invitation_url, error = None, None
+        if request.method == 'POST':
+            try:
+                token = access.invite(request.form.get('role'), actor=g.user['username'])
+                invitation_url = url_for('accept_invitation', token=token, _external=True)
+            except DomainError as exc:
+                error = str(exc)
+        users = store.query('SELECT username,role,created_at FROM users ORDER BY id')
+        return render_template('accounts.html', title='Сотрудники', section='accounts',
+                               users=users, invitation_url=invitation_url, error=error), 422 if error else 200
+
+    @app.route('/catalogs', methods=['GET', 'POST'])
+    def catalogs():
+        error = None
+        if request.method == 'POST':
+            try:
+                kind = request.form.get('kind')
+                upload = request.files.get('file')
+                if not upload or not upload.filename:
+                    raise DomainError('Выберите CSV-файл.')
+                data = upload.read(50_001)
+                rows = parse_csv(data, kind)
+                added, skipped = import_catalog(store, kind, rows, g.user['username'])
+                flash(f'Импорт завершён. Добавлено: {added}. Уже существовали: {skipped}. Остатки не менялись.', 'success')
+                return redirect(url_for('catalogs'))
+            except DomainError as exc:
+                error = str(exc)
+        return render_template('catalogs.html', title='Справочники', section='catalogs', error=error,
+                               products=store.catalog('products'), warehouses=store.catalog('warehouses')), 422 if error else 200
+
+    @app.get('/catalogs/<kind>/template.csv')
+    def catalog_template(kind):
+        examples = {'products': 'Наименование;Единица\nБумага туалетная;рулон\n',
+                    'warehouses': 'Наименование\nУчебный склад «Восточный»\n'}
+        if kind not in examples:
+            abort(404)
+        return Response('\ufeff' + examples[kind], content_type='text/csv; charset=utf-8',
+                        headers={'Content-Disposition': f'attachment; filename="{kind}-template.csv"'})
 
     def request_rows():
         return store.query('SELECT r.*,w.name AS warehouse FROM requests r '
@@ -92,10 +205,11 @@ def create_app(database=None, testing=False):
                 warehouse = int(request.form.get('warehouse', ''))
                 if kind == 'request':
                     request_id = store.create_request(warehouse, request.form.get('party', ''), lines,
-                                                      token, request.form.get('note', ''))
+                                                      token, request.form.get('note', ''), actor=g.user['username'])
                     flash('Заявка создана. Проверьте состав и зарезервируйте товары.', 'success')
                     return redirect(url_for('request_detail', request_id=request_id))
-                receipt_id = store.receive(warehouse, request.form.get('party', ''), lines, token)
+                receipt_id = store.receive(warehouse, request.form.get('party', ''), lines, token,
+                                           actor=g.user['username'])
                 flash(f'Поступление № {receipt_id} сохранено. Остатки обновлены.', 'success')
                 return redirect(url_for('stock'))
             except DomainError as exc:
@@ -131,7 +245,7 @@ def create_app(database=None, testing=False):
         if not store.request(request_id):
             abort(404)
         try:
-            store.transition(request_id, action)
+            store.transition(request_id, action, actor=g.user['username'])
             flash({'reserve': 'Товары зарезервированы.', 'issue': 'Передача подтверждена.',
                    'cancel': 'Заявка отменена. Резерв освобождён.'}[action], 'success')
         except DomainError as exc:
@@ -171,7 +285,9 @@ def create_app(database=None, testing=False):
 
     @app.errorhandler(400)
     @app.errorhandler(404)
+    @app.errorhandler(403)
     @app.errorhandler(409)
+    @app.errorhandler(410)
     @app.errorhandler(413)
     def error_page(error):
         messages = {404: 'Страница не найдена.', 413: 'Слишком большой запрос.'}

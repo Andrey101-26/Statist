@@ -15,10 +15,16 @@ def initialize_demo(store):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Statist database setup')
-    parser.add_argument('command', choices=['init-demo'])
-    parser.parse_args()
+    parser.add_argument('command', choices=['init-demo', 'invite-owner'])
+    parser.add_argument('--base-url', default='https://rey33.pythonanywhere.com')
+    args = parser.parse_args()
     try:
-        created = initialize_demo(create_app().extensions['store'])
-        print('Demo data initialized.' if created else 'Existing demo data preserved.')
+        app = create_app()
+        if args.command == 'init-demo':
+            created = initialize_demo(app.extensions['store'])
+            print('Demo data initialized.' if created else 'Existing demo data preserved.')
+        else:
+            token = app.extensions['access'].invite('coordinator', bootstrap=True)
+            print(args.base_url.rstrip('/') + '/join/' + token)
     except DomainError as exc:
         parser.exit(1, str(exc) + '\n')
