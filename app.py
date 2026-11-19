@@ -89,7 +89,8 @@ def create_app(database=None, testing=False):
                 error = 'Неверный логин или пароль.'
             except DomainError as exc:
                 error = str(exc)
-        return render_template('login.html', title='Вход', section='', error=error), 401 if error else 200
+        return render_template('login.html', title='Вход', section='', error=error,
+                               username=request.form.get('username', '')), 401 if error else 200
 
     @app.post('/logout')
     def logout():
@@ -122,7 +123,8 @@ def create_app(database=None, testing=False):
             except DomainError as exc:
                 error = str(exc)
         return render_template('join.html', title='Создание аккаунта', section='',
-                               invitation=invitation, error=error), 422 if error else 200
+                               invitation=invitation, error=error,
+                               username=request.form.get('username', '')), 422 if error else 200
 
     @app.route('/accounts', methods=['GET', 'POST'])
     def accounts():

@@ -5,6 +5,7 @@ import re
 import secrets
 import sqlite3
 import time
+import unicodedata
 
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -46,6 +47,10 @@ class Access:
     def digest(token):
         return hashlib.sha256(token.encode()).hexdigest()
 
+    @staticmethod
+    def normalize_username(username):
+        return unicodedata.normalize('NFKC', username.strip()).casefold()
+
     def user(self, user_id):
         rows = self.store.query('SELECT id,username,role FROM users WHERE id=?', (user_id,))
         return rows[0] if rows else None
@@ -73,9 +78,9 @@ class Access:
         return rows[0] if rows else None
 
     def register(self, token, username, password):
-        username = username.strip().lower()
-        if not re.fullmatch(r'[a-z0-9_.-]{3,32}', username):
-            raise DomainError('Логин: 3–32 латинские буквы, цифры, точка, дефис или подчёркивание.')
+        username = self.normalize_username(username)
+        if not re.fullmatch(r'[a-zа-яё0-9_.-]{3,32}', username):
+            raise DomainError('Логин: 3–32 русские или латинские буквы, цифры, точка, дефис или подчёркивание. Без пробелов.')
         if not 12 <= len(password) <= 128:
             raise DomainError('Пароль должен содержать от 12 до 128 символов.')
         password_hash = generate_password_hash(password)
@@ -102,7 +107,7 @@ class Access:
             limit = db.execute('SELECT failures FROM login_limits WHERE bucket=?', (bucket,)).fetchone()
             if limit and limit['failures'] >= 8:
                 raise DomainError('Слишком много попыток. Повторите вход через 15 минут.')
-            row = db.execute('SELECT * FROM users WHERE username=?', (username.strip(),)).fetchone()
+            row = db.execute('SELECT * FROM users WHERE username=?', (self.normalize_username(username),)).fetchone()
             valid_hash = check_password_hash(row['password_hash'] if row else self.dummy_hash,
                                              password if len(password) <= 128 else '')
             valid = bool(row and valid_hash and len(password) <= 128)

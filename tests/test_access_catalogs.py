@@ -98,6 +98,26 @@ class AccessAndImportTests(unittest.TestCase):
         with self.assertRaises(DomainError):
             self.access.invite('coordinator', bootstrap=True)
 
+    def test_cyrillic_username_registration_and_case_insensitive_login(self):
+        token = self.access.invite('observer')
+        user = self.access.register(token, ' АндрейЁ33 ', 'test-password-long-enough')
+        authenticated = self.access.login('АНДРЕЙЁ33', 'test-password-long-enough', 'another-peer')
+        self.assertEqual(authenticated['id'], user['id'])
+        with self.assertRaises(DomainError):
+            self.access.register(self.access.invite('observer'), 'андрейё33', 'test-password-long-enough')
+
+    def test_registration_error_retains_username_but_not_password(self):
+        token = self.access.invite('observer')
+        client, csrf = self.client_for(None)
+        client.get('/join/' + token)
+        response = client.post('/join', data={'csrf': csrf, 'username': 'Андрей33',
+            'password': 'short', 'password_repeat': 'short'})
+        self.assertEqual(response.status_code, 422)
+        html = response.get_data(as_text=True)
+        self.assertIn('value="Андрей33"', html)
+        self.assertNotIn('value="short"', html)
+        self.assertIsNotNone(self.access.invitation(token))
+
     def test_catalog_validation_and_atomic_rollback(self):
         before = self.store.catalog('products')
         with self.assertRaises(DomainError):
