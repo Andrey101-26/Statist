@@ -1,6 +1,7 @@
 """SQLite storage and atomic inventory operations. Quantities are whole units."""
 
 import json
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -82,6 +83,14 @@ class Store:
         if table not in ('products', 'warehouses'):
             raise ValueError('Unknown catalog')
         return self.query(f'SELECT * FROM {table} ORDER BY name')
+
+    def session_secret(self):
+        """Keep signed sessions valid across server restarts and workers."""
+        with self.connection(write=True) as db:
+            db.execute('INSERT OR IGNORE INTO metadata(key,value) VALUES(?,?)',
+                       ('session_secret', secrets.token_hex(32)))
+            return db.execute('SELECT value FROM metadata WHERE key=?',
+                              ('session_secret',)).fetchone()['value']
 
     @staticmethod
     def _text(value, label, limit=160):

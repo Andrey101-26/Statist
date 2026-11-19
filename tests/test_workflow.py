@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from app import create_app
+from manage import initialize_demo
 from store import DomainError, Store
 
 
@@ -101,6 +102,13 @@ class WorkflowTests(unittest.TestCase):
         self.store.transition(2, 'issue')
         self.assertEqual(self.balance(product=4)['on_hand'], 0)
 
+    def test_deployment_initialization_preserves_existing_operations(self):
+        self.store.transition(1, 'issue')
+        before = self.store.inventory()
+        self.assertFalse(initialize_demo(self.store))
+        self.assertEqual(self.store.inventory(), before)
+        self.assertEqual(self.store.request(1)['status'], 'issued')
+
 
 class WebTests(unittest.TestCase):
     def setUp(self):
@@ -130,6 +138,20 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.client.post('/requests/1/issue').status_code, 400)
         self.assertEqual(self.client.get('/requests/1/issue').status_code, 405)
         self.assertEqual(self.store.request(1)['status'], 'reserved')
+
+    def test_non_ascii_csrf_is_rejected_without_server_error(self):
+        response = self.client.post('/requests/1/issue', data={'csrf': 'неверный ключ'})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.store.request(1)['status'], 'reserved')
+
+    def test_session_survives_application_restart(self):
+        restarted = create_app(self.store.path, testing=True)
+        client = restarted.test_client()
+        client.set_cookie('session', self.client.get_cookie('session').value)
+        response = client.post('/requests/1/issue', data={'csrf': self.csrf})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(restarted.extensions['store'].request(1)['status'], 'issued')
+        self.assertEqual(client.get('/healthz').json, {'status': 'ok'})
 
     def test_complete_flow_through_http_and_escaped_input(self):
         response = self.client.post('/requests/new', data={

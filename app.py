@@ -1,4 +1,4 @@
-"""Statist: local educational prototype. Run python app.py --demo."""
+"""Statist application factory. Hosted entry point: wsgi.application."""
 
 import argparse
 import csv
@@ -21,19 +21,19 @@ STATUSES = {'draft': 'Ожидает резерва', 'reserved': 'В резер
 
 def create_app(database=None, testing=False):
     app = Flask(__name__)
-    app.config.update(SECRET_KEY=os.environ.get('STATIST_SECRET_KEY') or secrets.token_hex(32),
-                      TESTING=testing, MAX_CONTENT_LENGTH=64 * 1024,
+    app.config.update(TESTING=testing, MAX_CONTENT_LENGTH=64 * 1024,
                       SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax')
     app.jinja_loader = DictLoader(TEMPLATES)
     store = Store(database or os.environ.get('STATIST_DATABASE') or
                   Path(__file__).parent / 'instance' / 'statist.sqlite3')
     app.extensions['store'] = store
+    app.config['SECRET_KEY'] = os.environ.get('STATIST_SECRET_KEY') or store.session_secret()
 
     @app.before_request
     def csrf_protection():
         session.setdefault('csrf', secrets.token_hex(32))
         if request.method == 'POST' and not secrets.compare_digest(
-                session['csrf'], request.form.get('csrf', '')):
+                session['csrf'].encode(), request.form.get('csrf', '').encode()):
             abort(400, 'Форма устарела или открыта в другой сессии. Обновите страницу и повторите действие.')
 
     @app.after_request
@@ -55,6 +55,11 @@ def create_app(database=None, testing=False):
     def request_rows():
         return store.query('SELECT r.*,w.name AS warehouse FROM requests r '
                            'JOIN warehouses w ON w.id=r.warehouse_id ORDER BY r.id DESC')
+
+    @app.get('/healthz')
+    def health():
+        store.query('SELECT 1')
+        return {'status': 'ok'}
 
     @app.get('/')
     def dashboard():
